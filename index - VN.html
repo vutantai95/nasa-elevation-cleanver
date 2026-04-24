@@ -464,9 +464,13 @@ function initMap(){
 
 // === COORDS ===
 function applyCoords(lat,lon,moveMap=true,autoScan=false){
+  lon=((lon+180)%360+360)%360-180;
+  lon=+lon.toFixed(6);
   _lat=lat; _lon=lon;
   _skipInput=true;
-  document.getElementById('searchInput').value=`${lat}° N, ${lon}° E`;
+  const latDir=lat>=0?'N':'S';
+  const lonDir=lon>=0?'E':'W';
+  document.getElementById('searchInput').value=`${Math.abs(lat)}° ${latDir}, ${Math.abs(lon)}° ${lonDir}`;
   _skipInput=false;
   if(marker) marker.setLatLng([lat,lon]);
   if(map){ moveMap ? map.setView([lat,lon],map.getZoom()) : map.panTo([lat,lon]); }
@@ -564,23 +568,32 @@ function terrain(e){
 }
 
 // === API ===
+let _elevAbort=null;
+
 async function fetchElev(lat,lon){
+  // Cancel any in-flight elevation request
+  if(_elevAbort){ _elevAbort.abort(); }
+  _elevAbort=new AbortController();
+  const signal=_elevAbort.signal;
+
   if(_src==='open-elevation'){
     const r=await fetch('https://api.open-elevation.com/api/v1/lookup',{
       method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},
       body:JSON.stringify({locations:[{latitude:lat,longitude:lon}]}),
-      signal:AbortSignal.timeout(10000)
+      signal
     });
     if(!r.ok) throw new Error(r.status);
     const d=await r.json();
     if(!d.results?.[0]) throw new Error('No data');
+    _elevAbort=null;
     return{elevation:d.results[0].elevation};
   }
-  const r=await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${lat}&longitude=${lon}`,{signal:AbortSignal.timeout(9000)});
+  const r=await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${lat}&longitude=${lon}`,{signal});
   if(!r.ok) throw new Error(r.status);
   const d=await r.json();
   const v=Array.isArray(d.elevation)?d.elevation[0]:d.elevation;
   if(v==null) throw new Error('No data');
+  _elevAbort=null;
   return{elevation:v};
 }
 
@@ -616,7 +629,9 @@ async function doScan(){
     fetchLoc(_lat,_lon).then(name=>{
       document.getElementById('elevLoc').textContent=name||LANG[currentLang].unknown;
     });
-  }catch{
+  }catch(err){
+    // Silently ignore aborted requests (user moved map quickly)
+    if(err&&err.name==='AbortError') return;
     showToast(LANG[currentLang].errApi,true);
     badge.classList.remove('loading');
     document.getElementById('elevLoc').textContent=LANG[currentLang].errApi;
@@ -712,11 +727,25 @@ function acSelect(idx){
   const r=_acResults[idx]; if(!r) return;
   const lat=parseFloat(r.lat),lon=parseFloat(r.lon);
   _skipInput=true; document.getElementById('searchInput').value=r.name||r.display_name.split(',')[0]; _skipInput=false;
-  acClose(); applyCoords(lat,lon,true,true);
+  // Update coords immediately
+  _lat=lat; _lon=lon;
+  if(marker) marker.setLatLng([lat,lon]);
+  acClose();
+  // Cancel any in-flight elevation request before moving map
+  if(_elevAbort){ _elevAbort.abort(); _elevAbort=null; }
+  const afterMove=()=>{ doScan(); };
   if(r.boundingbox){
-    try{ map.fitBounds([[+r.boundingbox[0],+r.boundingbox[2]],[+r.boundingbox[1],+r.boundingbox[3]]],{maxZoom:15}); }
-    catch{ map.setView([lat,lon],14); }
-  }else map.setView([lat,lon],14);
+    try{
+      map.once('moveend', afterMove);
+      map.fitBounds([[+r.boundingbox[0],+r.boundingbox[2]],[+r.boundingbox[1],+r.boundingbox[3]]],{maxZoom:15});
+    }catch{
+      map.once('moveend', afterMove);
+      map.setView([lat,lon],14);
+    }
+  }else{
+    map.once('moveend', afterMove);
+    map.setView([lat,lon],14);
+  }
 }
 
 function acMoveFocus(dir){
